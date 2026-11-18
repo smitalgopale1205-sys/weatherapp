@@ -1,6 +1,6 @@
 """Open-Meteo client and weather helpers. All data comes from live API calls."""
 import requests
-
+import time
 GEO_URL = "https://geocoding-api.open-meteo.com/v1/search"
 FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 AIR_URL = "https://air-quality-api.open-meteo.com/v1/air-quality"
@@ -23,41 +23,36 @@ class WeatherError(Exception):
 
 
 def _get(url, params):
-    print(f"[WEATHER DEBUG] Requesting: {url}", flush=True)
+    for attempt in range(3):
+        try:
+            resp = requests.get(url, params=params, timeout=TIMEOUT)
 
-    try:
-        resp = requests.get(url, params=params, timeout=TIMEOUT)
+            if getattr(resp, "status_code", None) == 429:
+                if attempt < 2:
+                    time.sleep(5 * (attempt + 1))
+                    continue
 
-        print(
-    f"[WEATHER DEBUG] Status code: {getattr(resp, 'status_code', 'Not provided')}",
-    flush=True
-)
+                raise WeatherError(
+                    "Weather service is temporarily busy. Please try again later."
+                )
 
-        resp.raise_for_status()
+            resp.raise_for_status()
+            return resp.json()
 
-        data = resp.json()
-        print("[WEATHER DEBUG] JSON received successfully", flush=True)
+        except requests.Timeout as exc:
+            raise WeatherError(
+                "The weather service took too long to respond."
+            ) from exc
 
-        return data
+        except requests.RequestException as exc:
+            raise WeatherError(
+                "Could not reach the weather service. Check your connection."
+            ) from exc
 
-    except requests.Timeout as exc:
-        print(f"[WEATHER DEBUG] TIMEOUT: {exc}", flush=True)
-        raise WeatherError(
-            "The weather service took too long to respond."
-        ) from exc
-
-    except requests.RequestException as exc:
-        print(f"[WEATHER DEBUG] REQUEST ERROR: {exc}", flush=True)
-        raise WeatherError(
-            "Could not reach the weather service. Check your connection."
-        ) from exc
-
-    except ValueError as exc:
-        print(f"[WEATHER DEBUG] JSON ERROR: {exc}", flush=True)
-        raise WeatherError(
-            "The weather service returned an unreadable response."
-        ) from exc
-
+        except ValueError as exc:
+            raise WeatherError(
+                "The weather service returned an unreadable response."
+            ) from exc
 
 def search_cities(query, count=8):
     """Return matching cities worldwide as dicts with name, coordinates and label."""
