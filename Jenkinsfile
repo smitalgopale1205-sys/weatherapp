@@ -1,3 +1,4 @@
+
 pipeline {
     agent any
 
@@ -44,30 +45,14 @@ pipeline {
                 }
             }
         }
-
-        stage('Deploy to Render') {
-            when {
-                expression {
-                    env.BRANCH_NAME == 'main' ||
-                    env.GIT_BRANCH == 'origin/main' ||
-                    env.GIT_BRANCH == 'main'
-                }
-            }
-            steps {
-                withCredentials([string(credentialsId: 'render-deploy-hook', variable: 'RENDER_DEPLOY_HOOK')]) {
-                    bat 'curl.exe --fail --silent --show-error -X POST "%RENDER_DEPLOY_HOOK%"'
-                }
-            }
-        }
     }
 
     post {
         success {
-            echo 'All tests passed and deployment was triggered.'
+            echo 'All tests passed successfully. Streamlit Community Cloud handles deployment from GitHub.'
         }
         failure {
-            echo 'Pipeline failed. Deployment was not triggered.'
+            echo 'Pipeline failed. Please check the test results and console output.'
         }
     }
 }
-
