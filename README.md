@@ -1,26 +1,36 @@
-# Weather App
+# Isobar: Weather App with a CI/CD Pipeline
 
-A Streamlit app that looks up current conditions and a seven-day forecast for a city. Weather data comes from the [Open-Meteo](https://open-meteo.com/) geocoding and forecast APIs, so no API key is required.
+Streamlit + Plotly weather dashboard using live Open-Meteo data (geocoding, forecast, air quality; no API key needed). Tested with Pytest, built by Jenkins, deployed to Render.
 
-The UI lives in `app.py`. Network access and response parsing live in `weather_service.py`, which the tests exercise with a fake fetcher.
+**Features:** worldwide city search, current and feels-like temperature, humidity, wind, pressure, visibility, sunrise/sunset, 24-hour and 7-day forecasts, interactive charts, rain probability and precipitation, AQI/PM2.5/PM10, UV index, multi-city comparison, favorites, °C/°F toggle, insights, refresh, loading and error states.
 
 ## Run locally
-
 ```bash
-python -m pip install -r requirements.txt
+python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+pytest -v
 streamlit run app.py
 ```
 
-Enter a city and choose Celsius or Fahrenheit. The page shows the current temperature, feels-like temperature, humidity, wind, precipitation, and the next seven days.
+## Files
+| File | Purpose |
+|---|---|
+| `app.py` | Streamlit UI |
+| `weather_service.py` | Open-Meteo client, conversions, insights |
+| `test_app.py` | Offline pytest suite (all API calls mocked) |
+| `Jenkinsfile` | Checkout, venv, install, test, deploy |
+| `render.yaml` | Render web service (auto-deploy off) |
 
-## Tests
+## CI/CD setup
+1. **GitHub:** push this folder to a repository (branch `main`).
+2. **Render:** New > Blueprint (or Web Service), connect the repo. `render.yaml` sets build/start commands and `autoDeploy: false`, so Render never deploys on its own. Then open the service > Settings > **Deploy Hook** and copy the URL.
+3. **Jenkins:** needs Python 3.10+ with `venv`, `git` and `curl` on the agent.
+   - Manage Jenkins > Credentials > add **Secret text**, ID `render-deploy-hook`, value = the Render deploy hook URL.
+   - New Item > Pipeline > *Pipeline script from SCM* > Git > your repo URL, branch `*/main`, script path `Jenkinsfile`.
+   - Trigger builds with a GitHub webhook (`<jenkins-url>/github-webhook/`, plus the GitHub plugin's "GitHub hook trigger") or Poll SCM.
+4. Push to `main`: Jenkins runs the tests and calls the deploy hook only if they pass, on `main` only. One push gives one deployment.
 
-```bash
-python -m pytest -q
-```
-
-Tests cover a successful lookup, unit selection, blank input, unknown cities, incomplete API payloads, and HTTP or network failures. They do not call the live weather service.
-
-## Continuous integration
-
-`.github/workflows/ci.yml` installs `requirements.txt` on Python 3.12 and runs `pytest` on every push and pull request.
+## Notes
+- No secrets are stored in the repo; the deploy hook lives only in Jenkins credentials.
+- Weather is cached for 10 minutes; **Refresh weather** clears the cache.
+- Favorites are saved to `favorites.json` next to the app. On Render's free tier the disk is ephemeral, so favorites reset on redeploy.

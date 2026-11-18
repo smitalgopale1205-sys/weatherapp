@@ -1,253 +1,177 @@
-"""Weather lookup backed by the Open-Meteo geocoding and forecast APIs."""
+"""Open-Meteo client and weather helpers. All data comes from live API calls."""
+import requests
 
-from __future__ import annotations
-
-import json
-import urllib.error
-import urllib.parse
-import urllib.request
-from dataclasses import dataclass
-from typing import Any, Callable
-
-GEOCODING_URL = "https://geocoding-api.open-meteo.com/v1/search"
+GEO_URL = "https://geocoding-api.open-meteo.com/v1/search"
 FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
-DEFAULT_TIMEOUT_SECONDS = 15
+AIR_URL = "https://air-quality-api.open-meteo.com/v1/air-quality"
+TIMEOUT = 10
 
-WEATHER_CODES: dict[int, str] = {
-    0: "Clear sky",
-    1: "Mainly clear",
-    2: "Partly cloudy",
-    3: "Overcast",
-    45: "Fog",
-    48: "Depositing rime fog",
-    51: "Light drizzle",
-    53: "Moderate drizzle",
-    55: "Dense drizzle",
-    56: "Light freezing drizzle",
-    57: "Dense freezing drizzle",
-    61: "Slight rain",
-    63: "Moderate rain",
-    65: "Heavy rain",
-    66: "Light freezing rain",
-    67: "Heavy freezing rain",
-    71: "Slight snow",
-    73: "Moderate snow",
-    75: "Heavy snow",
-    77: "Snow grains",
-    80: "Slight rain showers",
-    81: "Moderate rain showers",
-    82: "Violent rain showers",
-    85: "Slight snow showers",
-    86: "Heavy snow showers",
-    95: "Thunderstorm",
-    96: "Thunderstorm with slight hail",
-    99: "Thunderstorm with heavy hail",
+WMO = {
+    0: "Clear sky", 1: "Mostly clear", 2: "Partly cloudy", 3: "Overcast",
+    45: "Fog", 48: "Rime fog", 51: "Light drizzle", 53: "Drizzle", 55: "Heavy drizzle",
+    56: "Freezing drizzle", 57: "Heavy freezing drizzle", 61: "Light rain", 63: "Rain",
+    65: "Heavy rain", 66: "Freezing rain", 67: "Heavy freezing rain", 71: "Light snow",
+    73: "Snow", 75: "Heavy snow", 77: "Snow grains", 80: "Light showers", 81: "Showers",
+    82: "Violent showers", 85: "Snow showers", 86: "Heavy snow showers",
+    95: "Thunderstorm", 96: "Thunderstorm with hail", 99: "Severe thunderstorm with hail",
 }
 
-Fetcher = Callable[[str], dict[str, Any]]
+
+class WeatherError(Exception):
+    """Raised when weather data cannot be fetched or understood."""
 
 
-class WeatherServiceError(Exception):
-    """Base error for weather lookups that the UI can show to the user."""
+def _get(url, params):
+    try:
+        resp = requests.get(url, params=params, timeout=TIMEOUT)
+        resp.raise_for_status()
+        return resp.json()
+    except requests.Timeout as exc:
+        raise WeatherError("The weather service took too long to respond.") from exc
+    except requests.RequestException as exc:
+        raise WeatherError("Could not reach the weather service. Check your connection.") from exc
+    except ValueError as exc:
+        raise WeatherError("The weather service returned an unreadable response.") from exc
 
 
-class CityNotFoundError(WeatherServiceError):
-    """Raised when geocoding returns no matching place."""
+def search_cities(query, count=8):
+    """Return matching cities worldwide as dicts with name, coordinates and label."""
+    query = (query or "").strip()
+    if len(query) < 2:
+        return []
+    data = _get(GEO_URL, {"name": query, "count": count, "language": "en", "format": "json"})
+    cities = []
+    for r in data.get("results") or []:
+        parts = [r.get("name"), r.get("admin1"), r.get("country")]
+        cities.append({
+            "name": r.get("name", ""), "country": r.get("country", ""), "admin1": r.get("admin1", ""),
+            "latitude": r["latitude"], "longitude": r["longitude"], "timezone": r.get("timezone", "auto"),
+            "label": ", ".join(p for p in parts if p),
+        })
+    return cities
 
 
-@dataclass(frozen=True)
-class Location:
-    name: str
-    country: str
-    admin1: str
-    latitude: float
-    longitude: float
-    timezone: str
-
-    @property
-    def label(self) -> str:
-        parts = [self.name]
-        if self.admin1:
-            parts.append(self.admin1)
-        if self.country:
-            parts.append(self.country)
-        return ", ".join(parts)
+def get_air_quality(lat, lon):
+    data = _get(AIR_URL, {"latitude": lat, "longitude": lon, "timezone": "auto",
+                          "current": "us_aqi,pm10,pm2_5,uv_index"})
+    cur = data.get("current")
+    if not cur:
+        raise WeatherError("Air quality data is unavailable for this location.")
+    return {"aqi": cur.get("us_aqi"), "pm25": cur.get("pm2_5"), "pm10": cur.get("pm10"), "uv": cur.get("uv_index")}
 
 
-@dataclass(frozen=True)
-class CurrentWeather:
-    temperature: float
-    apparent_temperature: float
-    humidity_percent: int
-    wind_speed: float
-    precipitation: float
-    weather_code: int
-    description: str
-    observed_at: str
+def get_weather(lat, lon):
+    """Fetch and normalise current conditions, 24h hourly, 7-day daily and air quality."""
+    data = _get(FORECAST_URL, {
+        "latitude": lat, "longitude": lon, "timezone": "auto", "forecast_days": 7,
+        "current": "temperature_2m,apparent_temperature,relative_humidity_2m,is_day,weather_code,"
+                   "pressure_msl,wind_speed_10m,visibility",
+        "hourly": "temperature_2m,apparent_temperature,precipitation_probability,precipitation,weather_code",
+        "daily": "weather_code,temperature_2m_max,temperature_2m_min,sunrise,sunset,"
+                 "precipitation_sum,precipitation_probability_max,uv_index_max",
+    })
+    cur, hr, dy = data.get("current"), data.get("hourly"), data.get("daily")
+    if not (cur and hr and dy):
+        raise WeatherError("The weather service returned incomplete data.")
+    try:
+        air = get_air_quality(lat, lon)
+    except WeatherError:
+        air = None  # air quality is optional; the rest of the report still works
+
+    hours = [{"time": t, "temp": hr["temperature_2m"][i], "feels": hr["apparent_temperature"][i],
+              "prob": hr["precipitation_probability"][i], "precip": hr["precipitation"][i],
+              "code": hr["weather_code"][i]} for i, t in enumerate(hr["time"])]
+    start = cur["time"][:13] + ":00"
+    hours = [h for h in hours if h["time"] >= start][:24]
+    days = [{"date": d, "code": dy["weather_code"][i], "tmax": dy["temperature_2m_max"][i],
+             "tmin": dy["temperature_2m_min"][i], "sunrise": dy["sunrise"][i], "sunset": dy["sunset"][i],
+             "precip": dy["precipitation_sum"][i], "prob": dy["precipitation_probability_max"][i],
+             "uv": dy["uv_index_max"][i]} for i, d in enumerate(dy["time"])]
+    vis = cur.get("visibility")
+    uv = (air or {}).get("uv")
+    return {
+        "timezone": data.get("timezone"),
+        "current": {"time": cur["time"], "temp": cur.get("temperature_2m"), "feels": cur.get("apparent_temperature"),
+                    "humidity": cur.get("relative_humidity_2m"), "wind": cur.get("wind_speed_10m"),
+                    "pressure": cur.get("pressure_msl"), "visibility_km": None if vis is None else vis / 1000,
+                    "code": cur.get("weather_code"), "is_day": cur.get("is_day"),
+                    "uv": uv if uv is not None else (days[0]["uv"] if days else None)},
+        "hourly": hours, "daily": days, "air": air,
+    }
 
 
-@dataclass(frozen=True)
-class DailyForecast:
-    date: str
-    weather_code: int
-    description: str
-    temperature_max: float
-    temperature_min: float
-    precipitation: float
+def c_to_f(c):
+    return c * 9 / 5 + 32
 
 
-@dataclass(frozen=True)
-class WeatherReport:
-    location: Location
-    units: str
-    current: CurrentWeather
-    daily: list[DailyForecast]
+def convert(c, unit="C"):
+    return None if c is None else (c_to_f(c) if unit == "F" else c)
 
 
-def describe_weather(code: int) -> str:
-    return WEATHER_CODES.get(code, "Unknown conditions")
+def fmt_temp(c, unit="C"):
+    v = convert(c, unit)
+    return "—" if v is None else f"{round(v)}°"
 
 
-def weather_emoji(code: int) -> str:
-    if code == 0:
-        return "☀️"
-    if code in (1, 2):
-        return "🌤️"
-    if code == 3:
-        return "☁️"
-    if code in (45, 48):
-        return "🌫️"
-    if code in (51, 53, 55, 56, 57, 61, 63, 65, 66, 67, 80, 81, 82):
-        return "🌧️"
-    if code in (71, 73, 75, 77, 85, 86):
-        return "🌨️"
-    if code in (95, 96, 99):
-        return "⛈️"
-    return "🌡️"
+def describe(code):
+    return WMO.get(code, "Unknown conditions")
 
 
-class WeatherService:
-    """Fetches a current observation and a seven-day forecast for a city name."""
+def aqi_category(aqi):
+    if aqi is None:
+        return "Unavailable"
+    for limit, label in [(50, "Good"), (100, "Moderate"), (150, "Unhealthy for sensitive groups"),
+                         (200, "Unhealthy"), (300, "Very unhealthy")]:
+        if aqi <= limit:
+            return label
+    return "Hazardous"
 
-    def __init__(self, fetcher: Fetcher | None = None, timeout: float = DEFAULT_TIMEOUT_SECONDS):
-        self._fetcher = fetcher or self._http_get_json
-        self._timeout = timeout
 
-    def get_weather(self, city: str, units: str = "celsius") -> WeatherReport:
-        query = city.strip()
-        if not query:
-            raise WeatherServiceError("Enter a city name.")
-        if units not in ("celsius", "fahrenheit"):
-            raise WeatherServiceError("Units must be celsius or fahrenheit.")
+def uv_category(uv):
+    if uv is None:
+        return "Unavailable"
+    for limit, label in [(2, "Low"), (5, "Moderate"), (7, "High"), (10, "Very high")]:
+        if uv <= limit:
+            return label
+    return "Extreme"
 
-        location = self._geocode(query)
-        payload = self._fetcher(self._forecast_url(location, units))
-        return self._parse_report(location, units, payload)
 
-    def _geocode(self, city: str) -> Location:
-        params = urllib.parse.urlencode(
-            {"name": city, "count": 1, "language": "en", "format": "json"}
-        )
-        payload = self._fetcher(f"{GEOCODING_URL}?{params}")
-        results = payload.get("results") or []
-        if not results:
-            raise CityNotFoundError(f"No city found for '{city}'.")
-        match = results[0]
-        try:
-            return Location(
-                name=str(match["name"]),
-                country=str(match.get("country") or ""),
-                admin1=str(match.get("admin1") or ""),
-                latitude=float(match["latitude"]),
-                longitude=float(match["longitude"]),
-                timezone=str(match.get("timezone") or "auto"),
-            )
-        except (KeyError, TypeError, ValueError) as exc:
-            raise WeatherServiceError("The geocoding response was incomplete.") from exc
-
-    def _forecast_url(self, location: Location, units: str) -> str:
-        wind_unit = "kmh" if units == "celsius" else "mph"
-        params = urllib.parse.urlencode(
-            {
-                "latitude": location.latitude,
-                "longitude": location.longitude,
-                "timezone": location.timezone or "auto",
-                "temperature_unit": units,
-                "wind_speed_unit": wind_unit,
-                "precipitation_unit": "mm",
-                "current": ",".join(
-                    [
-                        "temperature_2m",
-                        "relative_humidity_2m",
-                        "apparent_temperature",
-                        "weather_code",
-                        "wind_speed_10m",
-                        "precipitation",
-                    ]
-                ),
-                "daily": ",".join(
-                    [
-                        "weather_code",
-                        "temperature_2m_max",
-                        "temperature_2m_min",
-                        "precipitation_sum",
-                    ]
-                ),
-                "forecast_days": 7,
-            }
-        )
-        return f"{FORECAST_URL}?{params}"
-
-    def _parse_report(self, location: Location, units: str, payload: dict[str, Any]) -> WeatherReport:
-        current = payload.get("current") or {}
-        daily = payload.get("daily") or {}
-        try:
-            code = int(current["weather_code"])
-            observation = CurrentWeather(
-                temperature=float(current["temperature_2m"]),
-                apparent_temperature=float(current["apparent_temperature"]),
-                humidity_percent=int(current["relative_humidity_2m"]),
-                wind_speed=float(current["wind_speed_10m"]),
-                precipitation=float(current["precipitation"]),
-                weather_code=code,
-                description=describe_weather(code),
-                observed_at=str(current.get("time") or ""),
-            )
-            dates = daily["time"]
-            codes = daily["weather_code"]
-            highs = daily["temperature_2m_max"]
-            lows = daily["temperature_2m_min"]
-            rain = daily["precipitation_sum"]
-            days = [
-                DailyForecast(
-                    date=str(dates[index]),
-                    weather_code=int(codes[index]),
-                    description=describe_weather(int(codes[index])),
-                    temperature_max=float(highs[index]),
-                    temperature_min=float(lows[index]),
-                    precipitation=float(rain[index]),
-                )
-                for index in range(len(dates))
-            ]
-        except (KeyError, TypeError, ValueError, IndexError) as exc:
-            raise WeatherServiceError("The forecast response was incomplete.") from exc
-        if not days:
-            raise WeatherServiceError("The forecast response did not include any days.")
-        return WeatherReport(location=location, units=units, current=observation, daily=days)
-
-    def _http_get_json(self, url: str) -> dict[str, Any]:
-        request = urllib.request.Request(url, headers={"User-Agent": "weather-app/1.0"})
-        try:
-            with urllib.request.urlopen(request, timeout=self._timeout) as response:
-                raw = response.read().decode("utf-8")
-        except urllib.error.HTTPError as exc:
-            raise WeatherServiceError(f"Weather service returned HTTP {exc.code}.") from exc
-        except urllib.error.URLError as exc:
-            raise WeatherServiceError("Could not reach the weather service.") from exc
-        try:
-            payload = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise WeatherServiceError("Weather service returned invalid JSON.") from exc
-        if not isinstance(payload, dict):
-            raise WeatherServiceError("Weather service returned an unexpected payload.")
-        return payload
+def insights(w, unit="C"):
+    """Plain-language recommendations derived from the fetched data."""
+    cur, out = w["current"], []
+    t, f = cur["temp"], cur["feels"]
+    if f is not None:
+        for limit, msg in [(0, "Freezing. Wear a heavy coat, gloves and a hat."),
+                           (10, "Cold. A warm jacket is a good idea."),
+                           (18, "Cool. A light jacket or sweater will do."),
+                           (27, "Comfortable for most outdoor plans."),
+                           (34, "Warm. Wear light clothing and carry water.")]:
+            if f < limit:
+                out.append(msg)
+                break
+        else:
+            out.append("Very hot. Avoid long afternoon exposure and drink water regularly.")
+    if t is not None and f is not None and abs(t - f) >= 4:
+        d = round(abs(t - f) * (1.8 if unit == "F" else 1))
+        out.append(f"It feels {d}° {'colder' if f < t else 'warmer'} than the air temperature.")
+    probs = [h["prob"] for h in w["hourly"] if h["prob"] is not None]
+    if probs:
+        p = max(probs)
+        out.append("Rain is likely (up to %d%%) in the next 24 hours. Carry an umbrella." % p if p >= 60 else
+                   "Showers are possible (up to %d%%). Keep a rain layer handy." % p if p >= 30 else
+                   "Rain is unlikely in the next 24 hours.")
+    uv = cur["uv"]
+    if uv is not None and uv >= 3:
+        out.append(f"UV index is {uv_category(uv).lower()} ({uv:.0f}). Use sunscreen and sunglasses outdoors.")
+    aqi = (w["air"] or {}).get("aqi")
+    if aqi is not None:
+        out.append("Air quality is good." if aqi <= 50 else
+                   "Air quality is moderate. Unusually sensitive people should limit long outdoor effort." if aqi <= 100 else
+                   "Air quality is poor. Sensitive groups should stay indoors and everyone should reduce outdoor exertion.")
+    if cur["wind"] is not None and cur["wind"] >= 40:
+        out.append("Strong wind. Secure loose items and take care when driving.")
+    if cur["humidity"] is not None and cur["humidity"] >= 80:
+        out.append("Humidity is high, so it may feel muggy.")
+    if cur["visibility_km"] is not None and cur["visibility_km"] < 1:
+        out.append("Visibility is low. Drive carefully.")
+    return out
