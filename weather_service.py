@@ -21,17 +21,42 @@ class WeatherError(Exception):
     """Raised when weather data cannot be fetched or understood."""
 
 
+
 def _get(url, params):
+    print(f"[WEATHER DEBUG] Requesting: {url}", flush=True)
+
     try:
         resp = requests.get(url, params=params, timeout=TIMEOUT)
+
+        print(
+    f"[WEATHER DEBUG] Status code: {getattr(resp, 'status_code', 'Not provided')}",
+    flush=True
+)
+
         resp.raise_for_status()
-        return resp.json()
+
+        data = resp.json()
+        print("[WEATHER DEBUG] JSON received successfully", flush=True)
+
+        return data
+
     except requests.Timeout as exc:
-        raise WeatherError("The weather service took too long to respond.") from exc
+        print(f"[WEATHER DEBUG] TIMEOUT: {exc}", flush=True)
+        raise WeatherError(
+            "The weather service took too long to respond."
+        ) from exc
+
     except requests.RequestException as exc:
-        raise WeatherError("Could not reach the weather service. Check your connection.") from exc
+        print(f"[WEATHER DEBUG] REQUEST ERROR: {exc}", flush=True)
+        raise WeatherError(
+            "Could not reach the weather service. Check your connection."
+        ) from exc
+
     except ValueError as exc:
-        raise WeatherError("The weather service returned an unreadable response.") from exc
+        print(f"[WEATHER DEBUG] JSON ERROR: {exc}", flush=True)
+        raise WeatherError(
+            "The weather service returned an unreadable response."
+        ) from exc
 
 
 def search_cities(query, count=8):
